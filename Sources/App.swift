@@ -19,6 +19,16 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var recorder: AudioCapture?
     var target: Destination?
     var held = false
+    private var recordingID = UUID()
+    private var pendingText: String?
+    private var clickMonitor: Any?
+    private var escapeMonitor: Any?
+    private var selectionMonitor: Any?
+    private var selectionPoint: CGPoint?
+    private func stopSelecting() {
+        if let selectionMonitor { NSEvent.removeMonitor(selectionMonitor); self.selectionMonitor = nil }
+        selectionPoint = nil
+    }
     var previous: Task<Void, Never>?
     var sessionObservers = [NSObjectProtocol]()
 
@@ -32,7 +42,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         for name in [AVCaptureDevice.wasConnectedNotification, AVCaptureDevice.wasDisconnectedNotification] {
             NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.prefs.discover() }
         }
-        panel = SettingsPanel(contentRect: NSRect(origin: .zero, size: settingsSize), styleMask: [.borderless], backing: .buffered, defer: false)
+        panel = SettingsPanel(contentRect: NSRect(origin: .zero, size: settingsSize), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isReleasedWhenClosed = false
         panel.delegate = self
         panel.level = .popUpMenu
@@ -68,6 +78,29 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         if !prefs.access && !monitors.isEmpty { monitors.forEach(NSEvent.removeMonitor); monitors = []; cancel() }
     }
+    private func clearPending() {
+        pendingText = nil
+        if let clickMonitor { NSEvent.removeMonitor(clickMonitor); self.clickMonitor = nil }
+        if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor); self.escapeMonitor = nil }
+    }
+    private func waitForField(_ text: String) {
+        clearPending()
+        pendingText = text
+        report("Щёлкните в поле для вставки · Esc для отмены")
+        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
+            guard let point = event.cgEvent?.location else { return }
+            Task { @MainActor in
+                guard let self, let phrase = self.pendingText, let destination = Destination(),
+                      destination.acceptsDictation, destination.containsClick(point) else { return }
+                self.clearPending()
+                let ok = await destination.type(phrase)
+                self.report(ok ? "" : "Ввод остановлен: изменился фокус")
+            }
+        }
+        escapeMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            if event.keyCode == 53 { self?.clearPending(); self?.report("") }
+        }
+    }
     @objc func togglePanel() { if panel.isVisible { panel.orderOut(nil) } else { showSettings() } }
     func windowDidResignKey(_ notification: Notification) {
         if panel.isVisible { panel.orderOut(nil) }
@@ -86,13 +119,13 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.setFrame(NSRect(x: x.rounded(), y: top - settingsSize.height, width: settingsSize.width, height: settingsSize.height), display: true)
     }
     func showSettings() {
-        prefs.discover()
-        NSApp.activate(ignoringOtherApps: true)
         positionSettings()
         panel.makeKeyAndOrderFront(nil)
+        DispatchQueue.main.async { self.prefs.discover() }
     }
     @objc private func copyLastTranscript() {
         guard let lastTranscript else { return }
+        clearPending(); report("")
         let clipboard = NSPasteboard.general
         clipboard.clearContents()
         if !clipboard.setString(lastTranscript, forType: .string) {
@@ -103,6 +136,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showSettings(); return true }
     func applicationWillTerminate(_ note: Notification) { cancel() }
     func cancel() {
+        recordingID = UUID(); stopSelecting(); clearPending()
         held = false; overlay?.orderOut(nil)
         if let recorder { recorder.stop { _ in try? FileManager.default.removeItem(at: recorder.url) } }
         recorder = nil; target = nil
@@ -119,6 +153,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard event.modifierFlags.intersection([.control,.command,.option,.shift]).isEmpty else { return }
         guard prefs.mic && prefs.access else { report("Проверьте разрешения в настройках RusType"); return }
         guard let device = prefs.device() else { report("Выбранный микрофон недоступен"); return }
+        recordingID = UUID(); stopSelecting(); clearPending(); report("")
         let capture = AudioCapture()
         recorder = capture
         levels.bars = Array(repeating: 0, count: levels.bars.count)
@@ -131,20 +166,26 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.overlay.orderFrontRegardless()
             }
         }
+        selectionMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
+            self?.selectionPoint = event.cgEvent?.location
+        }
         capture.start(device: device)
         target = Destination()
     }
     func finish() {
         overlay.orderOut(nil)
         guard let r = recorder else { return }
-        let destination = target
+        let initialDestination = target, id = recordingID
         recorder = nil; target = nil
         let url = r.url
         let stopped = Task { await withCheckedContinuation { continuation in r.stop { continuation.resume(returning: $0) } } }
         let before = previous, rules = prefs.rules
         previous = Task { @MainActor in
             await before?.value
-            defer { try? FileManager.default.removeItem(at: url) }
+            defer {
+                try? FileManager.default.removeItem(at: url)
+                if id == recordingID { stopSelecting() }
+            }
             do {
                 let frames = try await stopped.value.get()
                 guard frames > 1920 else { report("Слишком короткая запись"); return }
@@ -153,7 +194,18 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 guard !text.isEmpty else { report("Речь не распознана"); return }
                 self.lastTranscript = text.trimmingCharacters(in: .whitespacesAndNewlines)
                 self.prefs.canCopy = true
-                let ok = await destination?.type(text) ?? false
+                let destination: Destination?
+                if id == recordingID, let point = selectionPoint {
+                    let focused = Destination()
+                    destination = focused?.containsClick(point) == true ? focused : nil
+                } else {
+                    destination = initialDestination
+                }
+                guard let destination, destination.acceptsDictation, destination.current else {
+                    if id == recordingID { waitForField(text) }
+                    return
+                }
+                let ok = await destination.type(text)
                 report(ok ? "" : "Ввод остановлен: изменился фокус или недоступно разрешение")
             } catch { report("Не удалось распознать речь: " + error.localizedDescription) }
         }

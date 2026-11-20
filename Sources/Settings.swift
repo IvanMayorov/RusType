@@ -23,8 +23,10 @@ class Preferences: ObservableObject {
         rules = UserDefaults.standard.data(forKey: "dictionary.v1").flatMap { try? JSONDecoder().decode([Rule].self, from: $0) } ?? []
     }
     func refresh() {
-        mic = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
-        access = AXIsProcessTrusted()
+        let mic = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        let access = AXIsProcessTrusted()
+        if self.mic != mic { self.mic = mic }
+        if self.access != access { self.access = access }
     }
     func requestMic() {
         if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
