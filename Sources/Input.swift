@@ -3,11 +3,20 @@ import AppKit
 struct Destination {
     let pid: pid_t
     let field: AXUIElement?
+
+    static func prepareAccessibility(for app: NSRunningApplication?) {
+        guard let app, app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+        let application = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(application, 0.25)
+        // Chrome starts publishing web controls when assistive software requests its role.
+        var role: CFTypeRef?
+        AXUIElementCopyAttributeValue(application, kAXRoleAttribute as CFString, &role)
+        AXUIElementSetAttributeValue(application, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    }
+
     static func focus(_ pid: pid_t) -> AXUIElement? {
         var value: CFTypeRef?
         let application = AXUIElementCreateApplication(pid)
-        // Electron/Chromium apps expose their text fields only after this flag is set.
-        AXUIElementSetAttributeValue(application, "AXManualAccessibility" as CFString, kCFBooleanTrue)
         guard AXUIElementCopyAttributeValue(application, kAXFocusedUIElementAttribute as CFString, &value) == .success,
               let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
         return (value as! AXUIElement)
@@ -15,6 +24,7 @@ struct Destination {
     init?() {
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
         pid = app.processIdentifier
+        Self.prepareAccessibility(for: app)
         field = Self.focus(pid)
     }
     var acceptsDictation: Bool {
@@ -45,6 +55,31 @@ struct Destination {
         return AXValueGetValue(position as! AXValue, .cgPoint, &origin)
             && AXValueGetValue(size as! AXValue, .cgSize, &dimensions)
             && CGRect(origin: origin, size: dimensions).contains(point)
+    }
+
+    /// Up to `count` characters right before the caret (or selection), "" at the start of the field,
+    /// nil when the app does not expose its text through Accessibility.
+    func textBeforeCursor(_ count: Int = 8) -> String? {
+        guard let field else { return nil }
+        var rangeValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(field, kAXSelectedTextRangeAttribute as CFString, &rangeValue) == .success,
+              let rangeValue, CFGetTypeID(rangeValue) == AXValueGetTypeID() else { return nil }
+        var selection = CFRange()
+        guard AXValueGetValue(rangeValue as! AXValue, .cfRange, &selection), selection.location >= 0 else { return nil }
+        if selection.location == 0 { return "" }
+        let length = min(count, selection.location)
+        var before = CFRange(location: selection.location - length, length: length)
+        if let parameter = AXValueCreate(.cfRange, &before) {
+            var value: CFTypeRef?
+            if AXUIElementCopyParameterizedAttributeValue(field, kAXStringForRangeParameterizedAttribute as CFString, parameter, &value) == .success,
+               let text = value as? String, !text.isEmpty { return text }
+        }
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(field, kAXValueAttribute as CFString, &value) == .success,
+              let whole = value as? String else { return nil }
+        let units = Array(whole.utf16)
+        guard units.count <= 1_000_000, selection.location <= units.count else { return nil }
+        return String(decoding: units[(selection.location - length)..<selection.location], as: UTF16.self)
     }
 
     var current: Bool {

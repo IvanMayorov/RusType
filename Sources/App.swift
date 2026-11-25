@@ -2,17 +2,14 @@ import AppKit
 import SwiftUI
 import AVFoundation
 
-final class SettingsPanel: NSPanel {
-    override var canBecomeKey: Bool { true }
-    override func cancelOperation(_ sender: Any?) { orderOut(sender) }
-}
-
-final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let prefs = Preferences()
     var item: NSStatusItem!
     private var lastTranscript: String?
-    var panel: SettingsPanel!
-    var settingsSize = CGSize(width: 300, height: 160)
+    var popover: NSPopover!
+    private var settingsController: NSHostingController<SettingsView>!
+    private var popoverClosedAt = Date.distantPast
+    private var appBeforeSettings: NSRunningApplication?
     let levels = Levels()
     var overlay: NSPanel!
     var monitors = [Any]()
@@ -38,31 +35,28 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         item.button?.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "RusType")
         item.button?.target = self
         item.button?.action = #selector(togglePanel)
+        item.button?.sendAction(on: [.leftMouseUp])
         prefs.discover()
         for name in [AVCaptureDevice.wasConnectedNotification, AVCaptureDevice.wasDisconnectedNotification] {
             NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.prefs.discover() }
         }
-        panel = SettingsPanel(contentRect: NSRect(origin: .zero, size: settingsSize), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        panel.isReleasedWhenClosed = false
-        panel.delegate = self
-        panel.level = .popUpMenu
-        panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = true
-        let settings = SettingsView(prefs: prefs, copyText: { [weak self] in self?.copyLastTranscript() }, quit: { NSApp.terminate(nil) })
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-            .background(GeometryReader { geometry in
-                Color.clear.onAppear { self.resizeSettings(geometry.size) }
-                    .onChange(of: geometry.size) { self.resizeSettings($0) }
-            })
-        panel.contentView = NSHostingView(rootView: settings)
+        settingsController = NSHostingController(rootView: SettingsView(prefs: prefs, copyText: { [weak self] in self?.copyLastTranscript() }, quit: { NSApp.terminate(nil) }))
+        settingsController.sizingOptions = [.preferredContentSize]
+        popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = true
+        popover.delegate = self
+        popover.contentViewController = settingsController
         overlay = NSPanel(contentRect: NSRect(origin: .zero, size: RecordingBadge.size), styleMask: [.borderless,.nonactivatingPanel], backing: .buffered, defer: false)
         overlay.backgroundColor = .clear; overlay.isOpaque = false; overlay.hasShadow = false
         overlay.ignoresMouseEvents = true; overlay.level = .floating
         overlay.collectionBehavior = [.canJoinAllSpaces,.fullScreenAuxiliary]
         overlay.contentView = NSHostingView(rootView: RecordingBadge(levels: levels))
         let ws = NSWorkspace.shared.notificationCenter
+        sessionObservers.append(ws.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            guard self?.prefs.access == true else { return }
+            Destination.prepareAccessibility(for: note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)
+        })
         for name in [NSWorkspace.willSleepNotification, NSWorkspace.sessionDidResignActiveNotification] {
             sessionObservers.append(ws.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.cancel() })
         }
@@ -73,6 +67,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func refresh() {
         prefs.refresh()
         if prefs.access && monitors.isEmpty {
+            Destination.prepareAccessibility(for: NSWorkspace.shared.frontmostApplication)
             if let m = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged, handler: { [weak self] in self?.key($0) }) { monitors.append(m) }
             if let m = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged, handler: { [weak self] in self?.key($0); return $0 }) { monitors.append(m) }
         }
@@ -93,7 +88,11 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 guard let self, let phrase = self.pendingText, let destination = Destination(),
                       destination.acceptsDictation, destination.containsClick(point) else { return }
                 self.clearPending()
-                let ok = await destination.type(phrase)
+                // Let the clicked app move its caret before reading the text around it.
+                try? await Task.sleep(nanoseconds: 60_000_000)
+                let fitted = Dictation.fit(phrase, after: destination.textBeforeCursor())
+                self.lastTranscript = fitted.trimmingCharacters(in: .whitespacesAndNewlines)
+                let ok = await destination.type(fitted)
                 self.report(ok ? "" : "Ввод остановлен: изменился фокус")
             }
         }
@@ -101,27 +100,34 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if event.keyCode == 53 { self?.clearPending(); self?.report("") }
         }
     }
-    @objc func togglePanel() { if panel.isVisible { panel.orderOut(nil) } else { showSettings() } }
-    func windowDidResignKey(_ notification: Notification) {
-        if panel.isVisible { panel.orderOut(nil) }
-    }
-    func resizeSettings(_ size: CGSize) {
-        guard size.width > 0, size.height > 0, size != settingsSize else { return }
-        settingsSize = size
-        DispatchQueue.main.async { if self.panel.isVisible { self.positionSettings() } }
-    }
-    func positionSettings() {
-        guard let button = item.button, let window = button.window, let screen = window.screen else { return }
-        let anchor = window.convertToScreen(button.convert(button.bounds, to: nil))
-        let bounds = screen.frame
-        let x = min(max(anchor.midX - settingsSize.width / 2, bounds.minX + 4), bounds.maxX - settingsSize.width - 4)
-        let top = min(anchor.minY, bounds.maxY - NSStatusBar.system.thickness) - 2
-        panel.setFrame(NSRect(x: x.rounded(), y: top - settingsSize.height, width: settingsSize.width, height: settingsSize.height), display: true)
+    @objc func togglePanel() {
+        if popover.isShown { popover.performClose(nil); return }
+        // A click on the icon first closes the transient popover; don't reopen it on the same click.
+        guard Date().timeIntervalSince(popoverClosedAt) > 0.3 else { return }
+        showSettings()
     }
     func showSettings() {
-        positionSettings()
-        panel.makeKeyAndOrderFront(nil)
-        DispatchQueue.main.async { self.prefs.discover() }
+        guard let button = item.button else { return }
+        if popover.isShown { return }
+        if button.window == nil { DispatchQueue.main.async { self.showSettings() }; return }
+        prefs.discover()
+        settingsController.view.layoutSubtreeIfNeeded()
+        let size = settingsController.view.fittingSize
+        if size.width > 0, size.height > 0 { popover.contentSize = size }
+        let front = NSWorkspace.shared.frontmostApplication
+        if front?.processIdentifier != ProcessInfo.processInfo.processIdentifier { appBeforeSettings = front }
+        NSApp.activate(ignoringOtherApps: true)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        if let window = popover.contentViewController?.view.window {
+            window.makeKey()
+            window.makeFirstResponder(nil) // no blue focus ring on the first control
+        }
+    }
+    func popoverDidClose(_ notification: Notification) {
+        popoverClosedAt = Date()
+        // Hand focus back to the app the user was typing in, unless they already switched elsewhere.
+        if NSApp.isActive, let app = appBeforeSettings, !app.isTerminated { app.activate() }
+        appBeforeSettings = nil
     }
     @objc private func copyLastTranscript() {
         guard let lastTranscript else { return }
@@ -205,7 +211,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if id == recordingID { waitForField(text) }
                     return
                 }
-                let ok = await destination.type(text)
+                let phrase = Dictation.fit(text, after: destination.textBeforeCursor())
+                self.lastTranscript = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
+                let ok = await destination.type(phrase)
                 report(ok ? "" : "Ввод остановлен: изменился фокус или недоступно разрешение")
             } catch { report("Не удалось распознать речь: " + error.localizedDescription) }
         }

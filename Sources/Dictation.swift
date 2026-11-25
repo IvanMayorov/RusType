@@ -34,6 +34,27 @@ enum Dictation {
         return text.trimmingCharacters(in: .whitespacesAndNewlines) + " "
     }
 
+    /// Adapts a prepared phrase to the text before the caret: continue in lowercase mid-sentence.
+    /// `prefix == nil` means the context is unknown, so the phrase is left as is.
+    static func fit(_ text: String, after prefix: String?) -> String {
+        guard let prefix, let first = text.first else { return text }
+        guard let lastChar = prefix.last, !lastChar.isNewline else { return text }
+        let trailing = prefix.reversed().prefix { $0.isWhitespace }
+        if trailing.contains(where: { $0.isNewline }) { return text }
+        // Look through closing quotes and brackets: «Готово.» / (см. выше.)
+        var meaningful = prefix.trimmingCharacters(in: .whitespaces)
+        while let last = meaningful.last, "\"'»”’)]}".contains(last) { meaningful.removeLast() }
+        guard let last = meaningful.last else { return text }
+        let space = !lastChar.isWhitespace && !first.isPunctuation && !"([{«“„/".contains(lastChar) ? " " : ""
+        if ".!?…".contains(last) { return space + text }
+        var result = text
+        let second = text.dropFirst().first
+        if first.isUppercase, second?.isUppercase != true {
+            result = first.lowercased() + text.dropFirst()
+        }
+        return space + result
+    }
+
     static func recognize(_ wav: URL) throws -> String {
         let resources = Bundle.main.resourceURL!
         let result = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
